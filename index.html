@@ -50,7 +50,7 @@ header{display:flex; align-items:baseline; justify-content:space-between; gap:16
 .cam video,.cam canvas{position:absolute; inset:0; width:100%; height:100%; object-fit:cover; transform:scaleX(-1)}
 .cam .empty{position:absolute; inset:0; display:grid; place-items:center; text-align:center; padding:20px; color:var(--soft); font-size:15px}
 .count{position:absolute; inset:0; display:grid; place-items:center; font-family:var(--display); font-size:96px; color:#fff; text-shadow:0 2px 20px rgba(0,0,0,.35); pointer-events:none}
-.count[hidden]{display:none}
+.count[hidden],.cam .empty[hidden]{display:none}
 .msg{margin:14px 0 0; font-size:15px; min-height:1.5em}
 .actions{display:flex; gap:10px; margin-top:14px; flex-wrap:wrap}
 button{font:600 15px/1 var(--body); border-radius:999px; padding:13px 20px; cursor:pointer; border:2px solid var(--ink); background:transparent; color:var(--ink)}
@@ -104,6 +104,7 @@ footer{margin-top:28px; color:var(--soft); font-size:13px}
         <div class="row"><label for="delay">Nudge me after</label>
           <select id="delay"><option value="5">5 seconds</option><option value="15" selected>15 seconds</option><option value="30">30 seconds</option><option value="60">1 minute</option></select></div>
         <div class="row"><label for="notify">Desktop notifications</label><input type="checkbox" id="notify"></div>
+        <div class="row"><label for="vol">Volume</label><input type="range" id="vol" min="0" max="100" value="80"></div>
         <div class="row"><label for="sound">Sound</label><span style="display:flex;gap:12px;align-items:center"><button id="testSound" type="button" style="padding:7px 14px;font-size:13px">Test</button><input type="checkbox" id="sound" checked></span></div>
       </div>
 
@@ -129,7 +130,7 @@ let landmarker=null, stream=null, loop=null;
 let mode="idle"; // idle | loading | live | calibrating | tracking
 let base=null, samples=[];
 let target=0, shown=0, raw=0;
-let badSince=null, lastNudge=0, nudges=0, watched=0, uprightT=0, lastTick=0;
+let badSince=null, alarming=false, lastBeep=0, nudges=0, watched=0, uprightT=0, lastTick=0;
 const TITLE=document.title;
 
 /* ---------- shrimp drawing ---------- */
@@ -225,10 +226,12 @@ async function start(){
   msg.textContent="Sit up straight with your shoulders in frame, then save it.";
   $("previewWrap").hidden=true;
   lastTick=performance.now();
-  loop=setInterval(tick, 200); // keeps running in background tabs (throttled to ~1/s)
+  // Worker timers aren't throttled like page timers, so tracking keeps pace in background tabs
+  const w=new Worker(URL.createObjectURL(new Blob(["setInterval(()=>postMessage(0),250)"],{type:"text/javascript"})));
+  w.onmessage=tick; loop=w;
 }
 function stop(){
-  clearInterval(loop); loop=null;
+  loop?.terminate(); loop=null;
   stream?.getTracks().forEach(t=>t.stop()); stream=null; video.srcObject=null;
   ctx.clearRect(0,0,overlay.width,overlay.height);
   $("empty").hidden=false; stopBtn.disabled=true; mainBtn.disabled=false;
@@ -282,10 +285,13 @@ function tick(){
   if(raw>=0.5){
     badSince ??= now;
     msg.textContent="You're curling.";
-    if(now-badSince>=delay && now-lastNudge>30000){ nudge(); lastNudge=now; }
+    if(now-badSince>=delay){
+      if(!alarming){ alarming=true; nudges++; $("nudges").textContent=nudges; notify(); }
+      if(now-lastBeep>=2500){ if($("sound").checked) chirp(); lastBeep=now; }
+    }
     if(now-badSince>=delay) document.title = document.title===TITLE ? "🦐 sit up!" : TITLE;
   }else{
-    badSince=null; document.title=TITLE; msg.textContent="Watching. Looking good.";
+    badSince=null; alarming=false; document.title=TITLE; msg.textContent="Watching. Looking good.";
   }
 }
 function drawOverlay(m){
@@ -300,9 +306,7 @@ function drawOverlay(m){
 }
 
 /* ---------- nudges ---------- */
-function nudge(){
-  nudges++; $("nudges").textContent=nudges;
-  if($("sound").checked) chirp();
+function notify(){
   if($("notify").checked && "Notification" in window && Notification.permission==="granted"){
     new Notification("You're turning into a shrimp 🦐", {body:"Chin up, shoulders back.", tag:"unshrimp"});
   }
@@ -315,13 +319,20 @@ function unlockAudio(){
 }
 ["pointerdown","keydown"].forEach(ev=>addEventListener(ev, unlockAudio, {passive:true}));
 $("testSound").addEventListener("click", ()=>{ unlockAudio(); chirp(); });
+let out=null;
 function chirp(){
   unlockAudio();
-  [880,1320].forEach((f,i)=>{
-    const o=ac.createOscillator(), g=ac.createGain(), t=ac.currentTime+i*0.12;
-    o.frequency.value=f; o.type="sine";
-    g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(0.2,t+0.02); g.gain.exponentialRampToValueAtTime(0.0001,t+0.18);
-    o.connect(g).connect(ac.destination); o.start(t); o.stop(t+0.2);
+  if(!out){ const comp=ac.createDynamicsCompressor(); comp.threshold.value=-10; comp.ratio.value=4; out=ac.createGain(); out.connect(comp).connect(ac.destination); }
+  out.gain.value = Math.pow($("vol").value/100, 1.5) * 2.2;
+  [988,1319,1760].forEach((f,i)=>{
+    const t=ac.currentTime+0.02+i*0.13;
+    for(const type of ["square","triangle"]){
+      const o=ac.createOscillator(), g=ac.createGain();
+      o.type=type; o.frequency.value=f;
+      const peak = type==="square"?0.35:0.6;
+      g.gain.setValueAtTime(0.0001,t); g.gain.exponentialRampToValueAtTime(peak,t+0.01); g.gain.exponentialRampToValueAtTime(0.0001,t+0.22);
+      o.connect(g).connect(out); o.start(t); o.stop(t+0.25);
+    }
   });
 }
 $("notify").addEventListener("change", async e=>{
